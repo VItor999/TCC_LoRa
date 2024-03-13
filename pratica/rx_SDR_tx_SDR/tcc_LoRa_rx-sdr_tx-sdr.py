@@ -1,0 +1,191 @@
+from tcc import Configurations as config
+from tcc import functions as f
+from tcc import SimpleLogger as logger 
+import zmq
+import serial 
+import time
+import threading
+import RX_RTL as rx_sdr
+import TX_SDR_LIME as tx_sdr
+
+MUTEX_TIME_RETRY_LOCK = 0.003 
+
+def rx_flowchart_loop(cr,sf,bw,output):
+    global run_rx_thread,mutex_rx_sdr,run_threads
+    run = False
+    rx_flowchart = rx_sdr.RX_RTL(cr=cr,sf=sf,bw=bw,out_file=output)
+    while not run:
+        run = run_threads and run_rx_thread
+    rx_flowchart.start()
+    while run:
+        run = run_threads and run_rx_thread
+        time.sleep(2)
+    rx_flowchart.stop()
+    rx_flowchart.wait()
+    print('RX Flowchart thread stopped!')
+    return
+
+def set_run_threads(state):
+    global run_threads
+    while(not mutex_stop_thread.acquire(blocking=False)):
+        time.sleep(MUTEX_TIME_RETRY_LOCK)
+    run_threads = state
+    mutex_stop_thread.release()
+    return
+
+def stop_program():
+    global rx_thread
+    print('Exiting')
+    set_run_threads(False)
+    if(rx_thread.is_alive()):
+        rx_thread.join()
+    print('Exiting main thread')
+    exit()
+
+if __name__ == "__main__":
+
+#region CONFIGS
+    conf = config.Configurations('config.ini')
+    conf.update_configurations()
+
+    if (conf.can_start):
+        # FILES
+        tx_path = conf.tx_path
+        recv_path = conf.recv_path
+        log_path = conf.log_path
+        global_log_path = conf.global_log_path
+        result_path = conf.result_path
+        plot_path = conf.plot_path
+
+        # GNURadioParams
+        sample_rate = conf.sample_rate
+        center_freq = conf.center_freq
+        band_width = conf.band_width
+        s_fact = conf.s_fact
+        crs = conf.crs
+        has_crc = conf.has_crc
+        header = conf.header
+        noise_seed = 10 # conf.noise_seed
+        f_offset = conf.f_offset
+    
+        # Custom Simulation Params
+        message = conf.message
+        send_number = conf.send_number
+        taps_str_list = conf.taps_str_list
+        sim_level = conf.sim_lv
+        tx_power = conf.tx_power
+        msg_path = f'{tx_path}tx_text.txt'
+    #endregion    
+        
+#region FILES
+        f.delete_file(global_log_path)
+        f.clear_directory(recv_path)
+        f.clear_directory(log_path)
+        f.clear_directory(result_path)
+        f.create_dir(tx_path)
+        f.create_std_message(msg_path,message,send_number)
+       
+
+#endregion 
+
+#region LOG
+        log = logger.SimpleLogger(global_log_path=global_log_path)
+        if(conf.log_lv == 0):
+            log.global_logger.disabled = True
+            log.local_logger.disabled = True
+        else:
+            file_handler = logger.lg.FileHandler(global_log_path)
+            file_handler.setLevel(logger.lg.INFO)
+            file_handler.setFormatter(log.formatter)
+            log.global_logger.addHandler(file_handler)
+#endregion
+
+
+        msg = f'{f.read_line_from_binary(msg_path).decode("utf-8").split(",")[0]}\n'.encode("utf-8")
+        log.global_logger.info(f'Base message {msg}')
+        start_time = time.perf_counter()
+
+#region THREADS
+        run_threads = False # creating global thread control variable 
+        run_rx_thread = False
+        # Mutex
+        mutex_recv_path = threading.Lock()
+        mutex_stop_thread = threading.Lock()
+        mutex_rx_sdr = threading.Lock()
+        # Create and start the socket listening thread
+#endregion
+
+        start_time = time.perf_counter()
+        set_run_threads(True)
+        for cr in crs:
+            for sf in s_fact:
+                for bw in band_width:
+                    i=0
+                    rx_path_data = f'{recv_path}{cr}/rx_{sf}_{bw}/'
+                    folder_data_path = f'{result_path}sim_{cr}_{sf}_{bw}/'
+                    local_logs_path = f'{log_path}log/{cr}/{sf}_{bw}/'
+                    f.create_dir(folder_data_path)
+                    f.create_dir(local_logs_path)
+                    f.create_dir(rx_path_data)   
+                    option = ''
+                  
+                    
+                    #time.sleep(5)
+                    while option == '':
+                        print(f'Test with CR: {cr} SF: {sf} BW: {bw}')
+                        option = input(f'(Re)Insert attenuation level (dBm), or type exit to quit (or write q){i}:\t')
+                    while (option.lower() != 'exit' and option.lower() != 'q'):
+                        attenuation = float(option)
+                        log.global_logger.info(f'Simulation started:\n\tNumber of messages to send {send_number}\n\tCenter Frequency = {center_freq} \n\tSF = {sf} \n\tBW = {band_width}')
+                        log.global_logger.info(f'CR 4:{cr+4} \tSF: {sf} \tBW: {bw} \tPW: {tx_power}')
+                        log.global_logger.info(f'TX messages send from file: {msg_path}')
+                        log.global_logger.info(f'RX data stored in folder: {rx_path_data}')
+                        file_to_log = ''
+                        if (conf.log_lv == 2):
+                            file_to_log = logger.lg.FileHandler(f'{local_logs_path}log_{attenuation:2.2f}.txt')
+                            file_to_log.setLevel(logger.lg.INFO)
+                            log.local_logger.addHandler(file_to_log)
+
+                        log.local_logger.info(f'###### Starting Simulation attention = {attenuation}')
+                        log.local_logger.info(f'\t##### Bits per message:{len(msg)*8}')
+
+                        while(not mutex_recv_path.acquire(blocking=False)):
+                            time.sleep(MUTEX_TIME_RETRY_LOCK)
+                        recv_path_sim = f'{rx_path_data}{i}_rx_{attenuation:2.2f}.dat'
+                        mutex_recv_path.release()
+
+                        while(not mutex_rx_sdr.acquire(blocking=False)):
+                            time.sleep(MUTEX_TIME_RETRY_LOCK)
+                        run_rx_thread = True
+                        mutex_rx_sdr.release()  
+                        rx_thread = threading.Thread(target=rx_flowchart_loop,args=(cr,sf,bw,recv_path_sim))
+                        rx_thread.start()
+
+                        
+                        initial_time = time.perf_counter()
+                        tx_flowgraph = tx_sdr.TX_SDR_LIME(center_freq=center_freq, sf=sf,
+                                                    bw=bw, cr=cr ,has_crc=has_crc,
+                                                    impl_head=header, samp_rate=sample_rate, in_file=msg_path)
+                        tx_flowgraph.start()
+                        tx_flowgraph.wait()
+                       
+                        final_time = time.perf_counter()
+                        dif = final_time - initial_time
+                        formatted_duration = f.time_dif_format(dif)
+                        log.local_logger.info(f'\t###### Simulation duration: {formatted_duration}')
+                        log.local_logger.info(f'###### End of simulation')
+                        log.local_logger.removeHandler(file_to_log)
+                        i+=1 
+                        formatted_date_time = time.strftime("%Y-%m-%d %H:%M:%S")
+                        log.global_logger.info(f'End time {formatted_date_time}')
+                        log.global_logger.info(f'Total time spent: {formatted_duration}')
+                        tx_flowgraph.stop()
+                        del tx_flowgraph
+                        while(not mutex_rx_sdr.acquire(blocking=False)):
+                            time.sleep(MUTEX_TIME_RETRY_LOCK)
+                        run_rx_thread = False
+                        mutex_rx_sdr.release() 
+                        rx_thread.join() 
+                        option = input(f'(Re)Insert attenuation level (dBm), or type exit to quit (or write q){i}:\t')
+                               
+        stop_program()

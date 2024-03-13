@@ -1,0 +1,12 @@
+*__pycache__/
+*logs/
+*results/
+_old/
+test/__old
+pratica/__old
+logs/
+rx_data/
+*.pyc
+*.dat
+*.txt
+*.csv
